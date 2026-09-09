@@ -4,9 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     
-    <title>Splitgate Map Manager</title>
-    <meta name="title" content="Splitgate Map Manager">
-    <meta name="description" content="Drop, view, inspect, edit metadata, filter, create playlists, and package map packs directly in your browser.">
+    <title>Splitgate Map & Prefab Manager</title>
+    <meta name="title" content="Splitgate Map & Prefab Manager">
+    <meta name="description" content="Drop, view, inspect, edit metadata, filter, create playlists, and package map or prefab packs directly in your browser.">
     <meta name="theme-color" content="#3b82f6">
 
     <!-- JSZip Library für das Auslesen und Packen im Browser -->
@@ -118,7 +118,7 @@
             border-color: transparent;
         }
 
-        /* Toolbar für Playlist-Export */
+        /* Toolbar für Export */
         .batch-toolbar {
             display: none;
             justify-content: space-between;
@@ -244,6 +244,7 @@
             font-weight: 600;
         }
         .badge-edited { background: var(--success); color: white; }
+        .badge-type { background: #334155; color: var(--text-muted); }
         
         .btn {
             display: inline-block;
@@ -401,7 +402,7 @@
             align-items: center;
         }
 
-        /* Edit-Bereich als sauberes Overlay ohne störende blaue Linie */
+        /* Edit-Bereich als Overlay */
         .modal-edit-panel {
             position: absolute;
             bottom: 0;
@@ -476,13 +477,13 @@
 
 <div class="container" id="main-container">
     <header>
-        <h1>Splitgate Map Manager</h1>
-        <p>Drop your map folders or multiple .bin files to browse, search, edit metadata, create playlists, and package map packs.</p>
+        <h1>Splitgate Map & Prefab Manager</h1>
+        <p>Drop your map folders or multiple .bin files to browse, search, edit metadata, create playlists, and package packs.</p>
     </header>
 
     <div class="card-box">
         <div class="dropzone" id="dropzone" onclick="document.getElementById('file-input').click()">
-            <p>📁 Drag & drop your map folders or <b>.bin</b> files here<br>or <span>browse files</span></p>
+            <p>📁 Drag & drop your folders or <b>.bin</b> files here<br>or <span>browse files</span></p>
             <input type="file" id="file-input" class="hidden" multiple accept=".bin,.zip">
         </div>
         <div id="status-msg"></div>
@@ -490,13 +491,13 @@
 
     <!-- Suchleiste -->
     <div class="controls" id="controls-bar">
-        <input type="text" id="search" placeholder="Search map name or author..." oninput="filterMaps()">
+        <input type="text" id="search" placeholder="Search name or author..." oninput="filterMaps()">
     </div>
 
-    <!-- Toolbar für Playlist-Export -->
+    <!-- Toolbar für Export -->
     <div class="batch-toolbar" id="batch-toolbar">
-        <span id="selection-count" style="font-size: 14px; font-weight: 600;">0 maps selected</span>
-        <button class="btn" onclick="downloadSelectedMapPack()">📦 Download Selected as Map Pack (.zip)</button>
+        <span id="selection-count" style="font-size: 14px; font-weight: 600;">0 selected</span>
+        <button class="btn" id="batch-download-btn" onclick="downloadSelectedPack()">📦 Download Selected as Map Pack (.zip)</button>
     </div>
 
     <div class="grid" id="map-grid"></div>
@@ -507,7 +508,7 @@
     <div class="modal-content">
         <div class="modal-header">
             <div>
-                <div class="modal-title-area" id="modal-title">Map Title</div>
+                <div class="modal-title-area" id="modal-title">Title</div>
                 <div class="modal-subtitle" id="modal-subtitle">by Author</div>
             </div>
             <button class="close-btn" onclick="closeModal()">&times;</button>
@@ -515,15 +516,15 @@
         
         <div class="modal-body">
             <button class="nav-arrow prev-arrow" onclick="changeMap(-1)">&#10094;</button>
-            <img id="modal-img" src="" alt="Map Preview">
+            <img id="modal-img" src="" alt="Preview">
             <button class="nav-arrow next-arrow" onclick="changeMap(1)">&#10095;</button>
 
             <!-- Edit-Bereich als Overlay -->
             <div class="modal-edit-panel" id="edit-panel">
                 <div class="form-row">
                     <div class="form-group">
-                        <label for="modal-name">Map Name</label>
-                        <input type="text" id="modal-name" class="modal-input" placeholder="Map Name" oninput="markAsEdited(); syncHeaderLive();">
+                        <label for="modal-name">Name</label>
+                        <input type="text" id="modal-name" class="modal-input" placeholder="Name" oninput="markAsEdited(); syncHeaderLive();">
                     </div>
                     <div class="form-group">
                         <label for="modal-author">Author</label>
@@ -566,6 +567,7 @@
     const mainContainer = document.getElementById('main-container');
     const batchToolbar = document.getElementById('batch-toolbar');
     const controlsBar = document.getElementById('controls-bar');
+    const batchDownloadBtn = document.getElementById('batch-download-btn');
 
     ['dragenter', 'dragover'].forEach(eventName => {
         dropzone.addEventListener(eventName, (e) => {
@@ -631,7 +633,7 @@
         mainContainer.classList.add('has-maps');
         controlsBar.classList.add('active');
         mapGrid.innerHTML = '';
-        statusMsg.textContent = `Processing ${binFiles.length} map(s)...`;
+        statusMsg.textContent = `Processing ${binFiles.length} file(s)...`;
         loadedMaps = [];
 
         for (let file of binFiles) {
@@ -639,12 +641,13 @@
                 const zip = new JSZip();
                 const loadedZip = await zip.loadAsync(file);
 
-                let mapName = "Unknown Map";
+                let itemName = "Unknown Item";
                 let author = "Unknown Author";
                 let description = "";
                 let imageBlob = null;
                 let imagePath = "screenshot.jpg";
                 let foundInfo = null;
+                let itemType = "map"; // Standard
 
                 for (let relativePath of Object.keys(loadedZip.files)) {
                     let lower = relativePath.toLowerCase();
@@ -653,6 +656,10 @@
                     } else if (lower.endsWith('.jpg') || lower.endsWith('.png')) {
                         imagePath = relativePath;
                         imageBlob = await loadedZip.files[relativePath].async('blob');
+                    } else if (lower.includes('prefab.cf1047_prefab')) {
+                        itemType = "prefab";
+                    } else if (lower.includes('world.cf1047')) {
+                        itemType = "map";
                     }
                 }
 
@@ -660,7 +667,7 @@
                     try {
                         const cleanJson = foundInfo.trim().replace(/^\uFEFF/, '');
                         const data = JSON.parse(cleanJson);
-                        if (data.name) mapName = data.name;
+                        if (data.name) itemName = data.name;
                         if (data.author) author = data.author;
                         if (data.description) description = data.description;
                     } catch (err) {
@@ -671,10 +678,11 @@
                 let imageUrl = imageBlob ? URL.createObjectURL(imageBlob) : null;
 
                 loadedMaps.push({
-                    name: mapName,
+                    name: itemName,
                     author: author,
                     description: description,
                     fileName: file.name,
+                    type: itemType, // 'map' oder 'prefab'
                     image: imageUrl,
                     imageBlob: imageBlob,
                     imagePath: imagePath,
@@ -688,7 +696,7 @@
         }
 
         filterMaps();
-        statusMsg.textContent = `Successfully loaded and identified ${loadedMaps.length} map(s).`;
+        statusMsg.textContent = `Successfully loaded and identified ${loadedMaps.length} item(s).`;
     }
 
     function filterMaps() {
@@ -705,7 +713,7 @@
         mapGrid.innerHTML = '';
         
         if (filteredMaps.length === 0) {
-            mapGrid.innerHTML = '<p style="grid-column: 1/-1; text-align: center; color: var(--text-muted);">No maps match your search.</p>';
+            mapGrid.innerHTML = '<p style="grid-column: 1/-1; text-align: center; color: var(--text-muted);">No items match your search.</p>';
             return;
         }
 
@@ -722,6 +730,8 @@
                 imgHtml = `<div class="card-img-wrapper" id="${cardImgId}"><img src="${map.image}" alt="${escapeHtml(map.name)}"></div>`;
             }
 
+            const typeBadge = `<span class="badge badge-type">${map.type.toUpperCase()}</span>`;
+
             card.innerHTML = `
                 <div class="card-select-indicator">✓</div>
                 ${imgHtml}
@@ -730,6 +740,7 @@
                         <div class="map-title" id="card-title-${globalIndex}">${escapeHtml(map.name)}</div>
                         <div class="map-author" id="card-author-${globalIndex}">by ${escapeHtml(map.author)}</div>
                         <div class="badges">
+                            ${typeBadge}
                             ${map.isEdited ? '<span class="badge badge-edited">Edited</span>' : ''}
                         </div>
                     </div>
@@ -747,10 +758,25 @@
     }
 
     function updateBatchToolbar() {
-        const selectedCount = loadedMaps.filter(m => m.selected).length;
+        const selectedItems = loadedMaps.filter(m => m.selected);
+        const selectedCount = selectedItems.length;
+
         if (selectedCount > 0) {
             batchToolbar.classList.add('active');
-            document.getElementById('selection-count').textContent = `${selectedCount} map(s) selected`;
+            document.getElementById('selection-count').textContent = `${selectedCount} selected`;
+
+            // Typ-Erkennung für den Button
+            const hasMaps = selectedItems.some(m => m.type === 'map');
+            const hasPrefabs = selectedItems.some(m => m.type === 'prefab');
+
+            let packName = "Map Pack";
+            if (hasMaps && hasPrefabs) {
+                packName = "Mixed Pack";
+            } else if (hasPrefabs) {
+                packName = "Prefab Pack";
+            }
+
+            batchDownloadBtn.textContent = `📦 Download Selected as ${packName} (.zip)`;
         } else {
             batchToolbar.classList.remove('active');
         }
@@ -864,7 +890,7 @@
         document.getElementById('modal-filename').textContent = map.fileName;
         
         document.getElementById('modal-title').textContent = map.name;
-        document.getElementById('modal-subtitle').textContent = `by ${map.author}`;
+        document.getElementById('modal-subtitle').textContent = `by ${map.author} (${map.type.toUpperCase()})`;
 
         const imgElement = document.getElementById('modal-img');
         if (map.image) {
@@ -876,17 +902,18 @@
     }
 
     function syncHeaderLive() {
-        const nameVal = document.getElementById('modal-name').value.trim() || "Unknown Map";
+        const nameVal = document.getElementById('modal-name').value.trim() || "Unknown";
         const authorVal = document.getElementById('modal-author').value.trim() || "Unknown Author";
+        const map = loadedMaps[currentIndex];
         document.getElementById('modal-title').textContent = nameVal;
-        document.getElementById('modal-subtitle').textContent = `by ${authorVal}`;
+        document.getElementById('modal-subtitle').textContent = `by ${authorVal} (${map ? map.type.toUpperCase() : 'MAP'})`;
     }
 
     function saveCurrentModalData() {
         const map = loadedMaps[currentIndex];
         if (!map) return;
 
-        map.name = document.getElementById('modal-name').value.trim() || "Unknown Map";
+        map.name = document.getElementById('modal-name').value.trim() || "Unknown";
         map.author = document.getElementById('modal-author').value.trim() || "Unknown Author";
         map.description = document.getElementById('modal-desc').value.trim();
     }
@@ -918,11 +945,11 @@
 
         const nameWithoutExt = map.fileName.substring(0, map.fileName.lastIndexOf('.')) || map.fileName;
         let rawCode = nameWithoutExt.toLowerCase().replace(/[^a-z0-9-]/g, '');
-        let baseCode = rawCode.length > 8 ? rawCode.substring(0, 8) : (rawCode || "map");
+        let baseCode = rawCode.length > 8 ? rawCode.substring(0, 8) : (rawCode || "item");
 
         const cleanAuthor = convertToStrictLatin(map.author, false);
-        const cleanMap = convertToStrictLatin(map.name, true);
-        const targetBinName = `${baseCode}_${cleanAuthor}_${cleanMap}.bin`;
+        const cleanName = convertToStrictLatin(map.name, true);
+        const targetBinName = `${baseCode}_${cleanAuthor}_${cleanName}.bin`;
 
         const content = await map.zipObject.generateAsync({ type: "uint8array" });
 
@@ -952,23 +979,33 @@
         return { name: targetBinName, data: finalBytes };
     }
 
-    async function downloadSelectedMapPack() {
+    async function downloadSelectedPack() {
         saveCurrentModalData();
-        const selectedMaps = loadedMaps.filter(m => m.selected);
-        if (selectedMaps.length === 0) return;
+        const selectedItems = loadedMaps.filter(m => m.selected);
+        if (selectedItems.length === 0) return;
 
         const packZip = new JSZip();
 
-        for (let map of selectedMaps) {
+        for (let map of selectedItems) {
             const packaged = await buildPackagedBin(map);
             packZip.file(packaged.name, packaged.data);
+        }
+
+        const hasMaps = selectedItems.some(m => m.type === 'map');
+        const hasPrefabs = selectedItems.some(m => m.type === 'prefab');
+
+        let fileName = "Splitgate_MapPack.zip";
+        if (hasMaps && hasPrefabs) {
+            fileName = "Splitgate_MixedPack.zip";
+        } else if (hasPrefabs) {
+            fileName = "Splitgate_PrefabPack.zip";
         }
 
         const content = await packZip.generateAsync({ type: "blob" });
         const url = URL.createObjectURL(content);
         const a = document.createElement('a');
         a.href = url;
-        a.download = "Splitgate_MapPack.zip";
+        a.download = fileName;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);

@@ -87,6 +87,7 @@
             margin: 0;
             color: var(--text-muted);
             font-size: 14px;
+            line-height: 1.6;
         }
         .dropzone b {
             color: var(--text-color);
@@ -99,6 +100,7 @@
             gap: 10px;
             justify-content: center;
             margin-bottom: 20px;
+            align-items: center;
         }
         .controls.active {
             display: flex;
@@ -478,26 +480,29 @@
 <div class="container" id="main-container">
     <header>
         <h1>Splitgate Map & Prefab Manager</h1>
-        <p>Drop your map folders or multiple .bin files to browse, search, edit metadata, create playlists, and package packs.</p>
+        <p>Drop your map folders, <b>.bin</b> files, or packs here to browse, search, edit metadata, create playlists, and package packs.</p>
     </header>
 
     <div class="card-box">
         <div class="dropzone" id="dropzone" onclick="document.getElementById('file-input').click()">
-            <p>📁 Drag & drop your folders or <b>.bin</b> files here<br>or <span>browse files</span></p>
-            <input type="file" id="file-input" class="hidden" multiple accept=".bin,.zip">
+            <p>📁 Drag & drop your folders or files here:<br>
+            <b>.bin</b> &nbsp;|&nbsp; <b>.sgmaps</b> &nbsp;|&nbsp; <b>.sgprefabs</b> &nbsp;|&nbsp; <b>.sgmixed</b><br>
+            or <span>browse files</span></p>
+            <input type="file" id="file-input" class="hidden" multiple accept=".bin,.zip,.sgmaps,.sgprefabs,.sgmixed">
         </div>
         <div id="status-msg"></div>
     </div>
 
-    <!-- Suchleiste -->
+    <!-- Such- und Kontrollleiste mit Select All -->
     <div class="controls" id="controls-bar">
         <input type="text" id="search" placeholder="Search name or author..." oninput="filterMaps()">
+        <button class="btn btn-secondary" id="select-all-btn" onclick="toggleSelectAll()">☑️ Select All</button>
     </div>
 
     <!-- Toolbar für Export -->
     <div class="batch-toolbar" id="batch-toolbar">
         <span id="selection-count" style="font-size: 14px; font-weight: 600;">0 selected</span>
-        <button class="btn" id="batch-download-btn" onclick="downloadSelectedPack()">📦 Download Selected as Map Pack (.zip)</button>
+        <button class="btn" id="batch-download-btn" onclick="handleExport()">📦 Download Selected</button>
     </div>
 
     <div class="grid" id="map-grid"></div>
@@ -623,10 +628,11 @@
     }
 
     async function processFiles(files) {
-        const binFiles = Array.from(files).filter(f => f.name.endsWith('.bin') || f.name.endsWith('.zip'));
+        const validExts = ['.bin', '.zip', '.sgmaps', '.sgprefabs', '.sgmixed'];
+        const binFiles = Array.from(files).filter(f => validExts.some(ext => f.name.toLowerCase().endsWith(ext)));
         
         if (binFiles.length === 0) {
-            statusMsg.textContent = "No valid .bin files found in the dropped items.";
+            statusMsg.textContent = "No valid .bin or pack files found in the dropped items.";
             return;
         }
 
@@ -641,55 +647,19 @@
                 const zip = new JSZip();
                 const loadedZip = await zip.loadAsync(file);
 
-                let itemName = "Unknown Item";
-                let author = "Unknown Author";
-                let description = "";
-                let imageBlob = null;
-                let imagePath = "screenshot.jpg";
-                let foundInfo = null;
-                let itemType = "map"; // Standard
-
-                for (let relativePath of Object.keys(loadedZip.files)) {
-                    let lower = relativePath.toLowerCase();
-                    if (lower === 'info.json') {
-                        foundInfo = await loadedZip.files[relativePath].async('string');
-                    } else if (lower.endsWith('.jpg') || lower.endsWith('.png')) {
-                        imagePath = relativePath;
-                        imageBlob = await loadedZip.files[relativePath].async('blob');
-                    } else if (lower.includes('prefab.cf1047_prefab')) {
-                        itemType = "prefab";
-                    } else if (lower.includes('world.cf1047')) {
-                        itemType = "map";
+                const isPack = file.name.match(/\.(sgmaps|sgprefabs|sgmixed|zip)$/i);
+                
+                if (isPack && Object.keys(loadedZip.files).some(k => k.endsWith('.bin'))) {
+                    for (let relativePath of Object.keys(loadedZip.files)) {
+                        if (relativePath.toLowerCase().endsWith('.bin')) {
+                            const binBlob = await loadedZip.files[relativePath].async('blob');
+                            binBlob.name = relativePath.split('/').pop();
+                            await processSingleBin(binBlob, binBlob.name);
+                        }
                     }
+                } else {
+                    await processSingleBin(file, file.name);
                 }
-
-                if (foundInfo) {
-                    try {
-                        const cleanJson = foundInfo.trim().replace(/^\uFEFF/, '');
-                        const data = JSON.parse(cleanJson);
-                        if (data.name) itemName = data.name;
-                        if (data.author) author = data.author;
-                        if (data.description) description = data.description;
-                    } catch (err) {
-                        console.error("Error parsing info.json", err);
-                    }
-                }
-
-                let imageUrl = imageBlob ? URL.createObjectURL(imageBlob) : null;
-
-                loadedMaps.push({
-                    name: itemName,
-                    author: author,
-                    description: description,
-                    fileName: file.name,
-                    type: itemType, // 'map' oder 'prefab'
-                    image: imageUrl,
-                    imageBlob: imageBlob,
-                    imagePath: imagePath,
-                    zipObject: loadedZip,
-                    isEdited: false,
-                    selected: false
-                });
             } catch (err) {
                 console.error("Failed to read: " + file.name, err);
             }
@@ -699,12 +669,405 @@
         statusMsg.textContent = `Successfully loaded and identified ${loadedMaps.length} item(s).`;
     }
 
+    // ZIP helpers -----------------------------------------------------------
+    // .bin files are ZIP containers. We keep the original ZIP structure and
+    // compressed bytes and only rebuild entries that were actually changed.
+    const ZIP_LOCAL_SIG = 0x04034b50;
+    const ZIP_CENTRAL_SIG = 0x02014b50;
+    const ZIP_EOCD_SIG = 0x06054b50;
+
+    const ZIP_CRC_TABLE = (() => {
+        const table = new Uint32Array(256);
+        for (let n = 0; n < 256; n++) {
+            let c = n;
+            for (let k = 0; k < 8; k++) {
+                c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+            }
+            table[n] = c >>> 0;
+        }
+        return table;
+    })();
+
+    function crc32(bytes) {
+        let crc = 0xffffffff;
+        for (let i = 0; i < bytes.length; i++) {
+            crc = ZIP_CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+        }
+        return (crc ^ 0xffffffff) >>> 0;
+    }
+
+    function readU16(view, offset) {
+        return view.getUint16(offset, true);
+    }
+
+    function readU32(view, offset) {
+        return view.getUint32(offset, true);
+    }
+
+    function writeU32(view, offset, value) {
+        view.setUint32(offset, value >>> 0, true);
+    }
+
+    function findEndOfCentralDirectory(bytes) {
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const min = Math.max(0, bytes.byteLength - 22 - 0xffff);
+        for (let i = bytes.byteLength - 22; i >= min; i--) {
+            if (readU32(view, i) === ZIP_EOCD_SIG) return i;
+        }
+        throw new Error('Invalid ZIP: End of Central Directory not found.');
+    }
+
+    function decodeZipName(bytes, flags) {
+        // The files used by Splitgate are ASCII/UTF-8 names. TextDecoder is
+        // used here because ZIP UTF-8 names set bit 11 in the general flags.
+        return new TextDecoder((flags & 0x0800) ? 'utf-8' : 'utf-8').decode(bytes);
+    }
+
+    function encodeUtf8(text) {
+        return new TextEncoder().encode(text);
+    }
+
+    function parseZipStructure(arrayBuffer) {
+        const bytes = new Uint8Array(arrayBuffer);
+        const view = new DataView(arrayBuffer);
+        const eocdOffset = findEndOfCentralDirectory(bytes);
+        const totalEntries = readU16(view, eocdOffset + 10);
+        const centralSize = readU32(view, eocdOffset + 12);
+        const centralOffset = readU32(view, eocdOffset + 16);
+        const commentLength = readU16(view, eocdOffset + 20);
+        const comment = bytes.slice(eocdOffset + 22, eocdOffset + 22 + commentLength);
+
+        // ZIP64 is intentionally rejected rather than silently changing the
+        // archive format. Normal Splitgate .bin files use classic ZIP.
+        if (totalEntries === 0xffff || centralSize === 0xffffffff || centralOffset === 0xffffffff) {
+            throw new Error('ZIP64 archives are not supported by the surgical editor.');
+        }
+
+        const entries = [];
+        let p = centralOffset;
+        for (let i = 0; i < totalEntries; i++) {
+            if (readU32(view, p) !== ZIP_CENTRAL_SIG) {
+                throw new Error('Invalid ZIP: central directory entry not found.');
+            }
+
+            const versionMadeBy = readU16(view, p + 4);
+            const versionNeeded = readU16(view, p + 6);
+            const flags = readU16(view, p + 8);
+            const method = readU16(view, p + 10);
+            const modTime = readU16(view, p + 12);
+            const modDate = readU16(view, p + 14);
+            const crc = readU32(view, p + 16);
+            const compressedSize = readU32(view, p + 20);
+            const uncompressedSize = readU32(view, p + 24);
+            const nameLength = readU16(view, p + 28);
+            const extraLength = readU16(view, p + 30);
+            const commentLengthEntry = readU16(view, p + 32);
+            const diskStart = readU16(view, p + 34);
+            const internalAttr = readU16(view, p + 36);
+            const externalAttr = readU32(view, p + 38);
+            const localOffset = readU32(view, p + 42);
+
+            if (compressedSize === 0xffffffff || uncompressedSize === 0xffffffff || localOffset === 0xffffffff) {
+                throw new Error('ZIP64 entry encountered.');
+            }
+            if (flags & 0x0008) {
+                throw new Error('ZIP data descriptors are not supported because exact header preservation is required.');
+            }
+
+            const nameBytes = bytes.slice(p + 46, p + 46 + nameLength);
+            const extraBytes = bytes.slice(p + 46 + nameLength, p + 46 + nameLength + extraLength);
+            const commentBytes = bytes.slice(
+                p + 46 + nameLength + extraLength,
+                p + 46 + nameLength + extraLength + commentLengthEntry
+            );
+            const name = decodeZipName(nameBytes, flags);
+
+            if (readU32(view, localOffset) !== ZIP_LOCAL_SIG) {
+                throw new Error(`Invalid ZIP: local header missing for ${name}.`);
+            }
+
+            const localNameLength = readU16(view, localOffset + 26);
+            const localExtraLength = readU16(view, localOffset + 28);
+            const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
+            const dataEnd = dataOffset + compressedSize;
+            if (dataEnd > centralOffset || dataEnd > bytes.length) {
+                throw new Error(`Invalid ZIP: compressed data outside archive for ${name}.`);
+            }
+
+            entries.push({
+                name,
+                nameBytes,
+                extraBytes,
+                commentBytes,
+                versionMadeBy,
+                versionNeeded,
+                flags,
+                method,
+                modTime,
+                modDate,
+                crc,
+                compressedSize,
+                uncompressedSize,
+                diskStart,
+                internalAttr,
+                externalAttr,
+                originalLocalOffset: localOffset,
+                localNameLength,
+                localExtraLength,
+                dataOffset,
+                dataEnd,
+                compressedData: bytes.slice(dataOffset, dataEnd),
+                localHeader: bytes.slice(localOffset, dataOffset),
+                centralHeader: bytes.slice(p, p + 46 + nameLength + extraLength + commentLengthEntry)
+            });
+
+            p += 46 + nameLength + extraLength + commentLengthEntry;
+        }
+
+        if (p !== centralOffset + centralSize) {
+            throw new Error('Invalid ZIP: central directory size mismatch.');
+        }
+
+        return {
+            bytes,
+            entries,
+            eocd: {
+                diskNumber: readU16(view, eocdOffset + 4),
+                centralDisk: readU16(view, eocdOffset + 6),
+                entriesOnDisk: readU16(view, eocdOffset + 8),
+                totalEntries,
+                centralSize,
+                centralOffset,
+                comment
+            }
+        };
+    }
+
+    async function deflateSingleFile(name, dataBytes) {
+        // Let JSZip produce the DEFLATE stream. We only take the compressed
+        // payload out of that temporary ZIP; the Splitgate ZIP itself is
+        // assembled by our surgical writer below.
+        const tempZip = new JSZip();
+        tempZip.file(name, dataBytes, { compression: 'DEFLATE' });
+        const tempBytes = await tempZip.generateAsync({
+            type: 'uint8array',
+            compression: 'DEFLATE',
+            compressionOptions: { level: 6 }
+        });
+        const parsed = parseZipStructure(tempBytes.buffer);
+        if (parsed.entries.length !== 1 || parsed.entries[0].method !== 8) {
+            throw new Error('Could not create a DEFLATE stream for the changed ZIP entry.');
+        }
+        return parsed.entries[0].compressedData;
+    }
+
+    function concatUint8Arrays(parts) {
+        let total = 0;
+        for (const part of parts) total += part.length;
+        const result = new Uint8Array(total);
+        let offset = 0;
+        for (const part of parts) {
+            result.set(part, offset);
+            offset += part.length;
+        }
+        return result;
+    }
+
+    function makeLocalHeader(entry, crc, compressedSize, uncompressedSize) {
+        const header = new Uint8Array(entry.localHeader);
+        const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+        writeU32(view, 14, crc);
+        writeU32(view, 18, compressedSize);
+        writeU32(view, 22, uncompressedSize);
+        return header;
+    }
+
+    function makeCentralHeader(entry, crc, compressedSize, uncompressedSize, localOffset) {
+        const header = new Uint8Array(entry.centralHeader);
+        const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+        writeU32(view, 16, crc);
+        writeU32(view, 20, compressedSize);
+        writeU32(view, 24, uncompressedSize);
+        writeU32(view, 42, localOffset);
+        return header;
+    }
+
+    function makeEocd(eocd, centralOffset, centralSize, totalEntries) {
+        const result = new Uint8Array(22 + eocd.comment.length);
+        const view = new DataView(result.buffer);
+        writeU32(view, 0, ZIP_EOCD_SIG);
+        view.setUint16(4, eocd.diskNumber, true);
+        view.setUint16(6, eocd.centralDisk, true);
+        view.setUint16(8, totalEntries, true);
+        view.setUint16(10, totalEntries, true);
+        writeU32(view, 12, centralSize);
+        writeU32(view, 16, centralOffset);
+        view.setUint16(20, eocd.comment.length, true);
+        result.set(eocd.comment, 22);
+        return result;
+    }
+
+    async function surgicallyRebuildBin(map, changedEntries) {
+        const parsed = map.zipStructure;
+        const rebuiltLocalParts = [];
+        const rebuiltCentralParts = [];
+        const offsets = new Map();
+        let outputOffset = 0;
+
+        for (const entry of parsed.entries) {
+            const key = entry.name.toLowerCase();
+            const change = changedEntries.get(key);
+
+            let crc = entry.crc;
+            let compressedData = entry.compressedData;
+            let uncompressedSize = entry.uncompressedSize;
+
+            if (change) {
+                const data = change.data;
+                compressedData = await deflateSingleFile(entry.name, data);
+                crc = crc32(data);
+                uncompressedSize = data.length;
+            }
+
+            // Keep the original local header/name/extra fields. Only the
+            // checksummed size fields are changed for replaced entries.
+            const localHeader = makeLocalHeader(
+                entry,
+                crc,
+                compressedData.length,
+                uncompressedSize
+            );
+
+            offsets.set(key, outputOffset);
+            rebuiltLocalParts.push(localHeader, compressedData);
+            outputOffset += localHeader.length + compressedData.length;
+        }
+
+        const centralOffset = outputOffset;
+        let centralSize = 0;
+        for (const entry of parsed.entries) {
+            const key = entry.name.toLowerCase();
+            const change = changedEntries.get(key);
+            let crc = entry.crc;
+            let compressedSize = entry.compressedSize;
+            let uncompressedSize = entry.uncompressedSize;
+
+            if (change) {
+                const data = change.data;
+                // Reuse the already generated payload from the local rebuild.
+                const localPartsIndex = parsed.entries.indexOf(entry) * 2;
+                const compressedData = rebuiltLocalParts[localPartsIndex + 1];
+                crc = crc32(data);
+                compressedSize = compressedData.length;
+                uncompressedSize = data.length;
+            }
+
+            const centralHeader = makeCentralHeader(
+                entry,
+                crc,
+                compressedSize,
+                uncompressedSize,
+                offsets.get(key)
+            );
+            rebuiltCentralParts.push(centralHeader);
+            centralSize += centralHeader.length;
+        }
+
+        const eocd = makeEocd(parsed.eocd, centralOffset, centralSize, parsed.entries.length);
+        return concatUint8Arrays([...rebuiltLocalParts, ...rebuiltCentralParts, eocd]);
+    }
+
+    async function processSingleBin(fileData, fileName) {
+        const arrayBuffer = await fileData.arrayBuffer();
+        const zipStructure = parseZipStructure(arrayBuffer);
+        const zip = new JSZip();
+        const loadedZip = await zip.loadAsync(arrayBuffer);
+
+        let itemName = "Unknown Item";
+        let author = "Unknown Author";
+        let description = "";
+        let imageBlob = null;
+        let imagePath = "screenshot.jpg";
+        let foundInfo = null;
+        let itemType = "map";
+
+        for (let relativePath of Object.keys(loadedZip.files)) {
+            let lower = relativePath.toLowerCase();
+            if (lower === 'info.json') {
+                foundInfo = await loadedZip.files[relativePath].async('string');
+            } else if (lower.endsWith('.jpg') || lower.endsWith('.png')) {
+                imagePath = relativePath;
+                imageBlob = await loadedZip.files[relativePath].async('blob');
+            } else if (lower.includes('prefab.cf1047_prefab')) {
+                itemType = "prefab";
+            } else if (lower.includes('world.cf1047')) {
+                itemType = "map";
+            }
+        }
+
+        if (foundInfo) {
+            try {
+                const cleanJson = foundInfo.trim().replace(/^\uFEFF/, '');
+                const data = JSON.parse(cleanJson);
+                if (data.name) itemName = data.name;
+                if (data.author) author = data.author;
+                if (data.description) description = data.description;
+            } catch (err) {
+                console.error("Error parsing info.json", err);
+            }
+        }
+
+        let imageUrl = imageBlob ? URL.createObjectURL(imageBlob) : null;
+
+        loadedMaps.push({
+            name: itemName,
+            author: author,
+            description: description,
+            fileName: fileName,
+            type: itemType,
+            image: imageUrl,
+            imageBlob: imageBlob,
+            imagePath: imagePath,
+            originalBlob: new Blob([arrayBuffer], { type: 'application/octet-stream' }),
+            originalBytes: new Uint8Array(arrayBuffer),
+            zipStructure: zipStructure,
+            zipObject: loadedZip,
+            originalInfoText: foundInfo || '',
+            isEdited: false,
+            selected: false
+        });
+    }
+
+    function toggleSelectAll() {
+        if (filteredMaps.length === 0) return;
+
+        const allSelected = filteredMaps.every(map => map.selected);
+        const newState = !allSelected;
+
+        filteredMaps.forEach(map => {
+            map.selected = newState;
+        });
+
+        const btn = document.getElementById('select-all-btn');
+        if (btn) {
+            btn.innerHTML = newState ? '☐ Deselect All' : '☑️ Select All';
+        }
+
+        renderGrid();
+    }
+
     function filterMaps() {
         const query = document.getElementById('search').value.toLowerCase();
         
         filteredMaps = loadedMaps.filter(map => {
             return map.name.toLowerCase().includes(query) || map.author.toLowerCase().includes(query);
         });
+
+        const selectBtn = document.getElementById('select-all-btn');
+        if (selectBtn) {
+            const allSelected = filteredMaps.length > 0 && filteredMaps.every(map => map.selected);
+            selectBtn.innerHTML = allSelected ? '☐ Deselect All' : '☑️ Select All';
+        }
 
         renderGrid();
     }
@@ -765,18 +1128,22 @@
             batchToolbar.classList.add('active');
             document.getElementById('selection-count').textContent = `${selectedCount} selected`;
 
-            // Typ-Erkennung für den Button
-            const hasMaps = selectedItems.some(m => m.type === 'map');
-            const hasPrefabs = selectedItems.some(m => m.type === 'prefab');
+            if (selectedCount === 1) {
+                const singleItem = selectedItems[0];
+                batchDownloadBtn.textContent = `📦 Download Single ${singleItem.type.toUpperCase()} (.bin)`;
+            } else {
+                const hasMaps = selectedItems.some(m => m.type === 'map');
+                const hasPrefabs = selectedItems.some(m => m.type === 'prefab');
 
-            let packName = "Map Pack";
-            if (hasMaps && hasPrefabs) {
-                packName = "Mixed Pack";
-            } else if (hasPrefabs) {
-                packName = "Prefab Pack";
+                let packName = "Map Pack (.sgmaps)";
+                if (hasMaps && hasPrefabs) {
+                    packName = "Mixed Pack (.sgmixed)";
+                } else if (hasPrefabs) {
+                    packName = "Prefab Pack (.sgprefabs)";
+                }
+
+                batchDownloadBtn.textContent = `📦 Download Selected as ${packName}`;
             }
-
-            batchDownloadBtn.textContent = `📦 Download Selected as ${packName} (.zip)`;
         } else {
             batchToolbar.classList.remove('active');
         }
@@ -930,19 +1297,6 @@
     }
 
     async function buildPackagedBin(map) {
-        const infoObj = {
-            name: map.name,
-            author: map.author
-        };
-        if (map.description) {
-            infoObj.description = map.description;
-        }
-
-        map.zipObject.file("info.json", JSON.stringify(infoObj, null, 2));
-        if (map.imageBlob) {
-            map.zipObject.file(map.imagePath, map.imageBlob);
-        }
-
         const nameWithoutExt = map.fileName.substring(0, map.fileName.lastIndexOf('.')) || map.fileName;
         let rawCode = nameWithoutExt.toLowerCase().replace(/[^a-z0-9-]/g, '');
         let baseCode = rawCode.length > 8 ? rawCode.substring(0, 8) : (rawCode || "item");
@@ -951,39 +1305,58 @@
         const cleanName = convertToStrictLatin(map.name, true);
         const targetBinName = `${baseCode}_${cleanAuthor}_${cleanName}.bin`;
 
-        const content = await map.zipObject.generateAsync({ type: "uint8array" });
-
-        const commentStr = "Packed by CreativeCore1047";
-        const commentBytes = new TextEncoder().encode(commentStr);
-        
-        let eocdPos = -1;
-        for (let i = content.length - 22; i >= 0; i--) {
-            if (content[i] === 0x50 && content[i+1] === 0x4B && content[i+2] === 0x05 && content[i+3] === 0x06) {
-                eocdPos = i;
-                break;
-            }
+        // No edit = byte-for-byte identical original .bin.
+        if (!map.isEdited) {
+            return { name: targetBinName, data: map.originalBytes };
         }
 
-        let finalBytes = content;
-        if (eocdPos !== -1) {
-            const head = content.slice(0, eocdPos + 20);
-            const commentLen = commentBytes.length;
-            const lenBytes = new Uint8Array([commentLen & 0xff, (commentLen >> 8) & 0xff]);
-            
-            finalBytes = new Uint8Array(head.length + 2 + commentBytes.length);
-            finalBytes.set(head, 0);
-            finalBytes.set(lenBytes, head.length);
-            finalBytes.set(commentBytes, head.length + 2);
+        const infoObj = {
+            name: map.name,
+            author: map.author
+        };
+        if (map.description) {
+            infoObj.description = map.description;
         }
 
+        const infoBytes = encodeUtf8(JSON.stringify(infoObj, null, 2));
+        const changedEntries = new Map();
+        changedEntries.set('info.json', { data: infoBytes });
+
+        if (map.imageBlob) {
+            const imageBytes = new Uint8Array(await map.imageBlob.arrayBuffer());
+            changedEntries.set(map.imagePath.toLowerCase(), { data: imageBytes });
+        }
+
+        // Surgical rebuild: Info.json and Screenshot are replaced, while
+        // World.cf1047 / Prefab.cf1047_prefab and every other untouched entry
+        // retain their original compressed byte stream.
+        const finalBytes = await surgicallyRebuildBin(map, changedEntries);
         return { name: targetBinName, data: finalBytes };
     }
 
-    async function downloadSelectedPack() {
+    async function handleExport() {
         saveCurrentModalData();
         const selectedItems = loadedMaps.filter(m => m.selected);
         if (selectedItems.length === 0) return;
 
+        // Einzelner Download -> Direkte .bin Datei
+        if (selectedItems.length === 1) {
+            const map = selectedItems[0];
+            const packaged = await buildPackagedBin(map);
+            
+            const blob = new Blob([packaged.data], { type: "application/octet-stream" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = packaged.name;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            return;
+        }
+
+        // Mehrere Items -> Kombi-Pack (.sgmaps / .sgprefabs / .sgmixed)
         const packZip = new JSZip();
 
         for (let map of selectedItems) {
@@ -994,14 +1367,22 @@
         const hasMaps = selectedItems.some(m => m.type === 'map');
         const hasPrefabs = selectedItems.some(m => m.type === 'prefab');
 
-        let fileName = "Splitgate_MapPack.zip";
+        let fileName = "Splitgate_MapPack.sgmaps";
         if (hasMaps && hasPrefabs) {
-            fileName = "Splitgate_MixedPack.zip";
+            fileName = "Splitgate_MixedPack.sgmixed";
         } else if (hasPrefabs) {
-            fileName = "Splitgate_PrefabPack.zip";
+            fileName = "Splitgate_PrefabPack.sgprefabs";
         }
 
-        const content = await packZip.generateAsync({ type: "blob" });
+        // The outer pack is a normal ZIP container as well. Use DEFLATE for
+        // the packaged .bin entries instead of STORE. The .bin itself keeps
+        // its own internal ZIP structure and untouched game data byte-for-byte.
+        const content = await packZip.generateAsync({ 
+            type: "blob",
+            compression: "DEFLATE",
+            compressionOptions: { level: 6 }
+        });
+
         const url = URL.createObjectURL(content);
         const a = document.createElement('a');
         a.href = url;

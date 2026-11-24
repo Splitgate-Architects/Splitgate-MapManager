@@ -563,7 +563,7 @@
 <script>
     let loadedMaps = [];
     let filteredMaps = [];
-    let currentIndex = 0;
+    let currentIndex = -1;
 
     const dropzone = document.getElementById('dropzone');
     const fileInput = document.getElementById('file-input');
@@ -616,14 +616,25 @@
             });
         } else if (item.isDirectory) {
             const dirReader = item.createReader();
-            await new Promise((resolve) => {
-                dirReader.readEntries(async (entries) => {
-                    for (let i = 0; i < entries.length; i++) {
-                        await traverseFileTree(entries[i], filesList);
-                    }
-                    resolve();
-                });
+            const readAllEntries = () => new Promise((resolve, reject) => {
+                const allEntries = [];
+                const readBatch = () => {
+                    dirReader.readEntries((entries) => {
+                        if (entries.length === 0) {
+                            resolve(allEntries);
+                        } else {
+                            allEntries.push(...entries);
+                            readBatch();
+                        }
+                    }, reject);
+                };
+                readBatch();
             });
+
+            const entries = await readAllEntries();
+            for (let i = 0; i < entries.length; i++) {
+                await traverseFileTree(entries[i], filesList);
+            }
         }
     }
 
@@ -640,7 +651,17 @@
         controlsBar.classList.add('active');
         mapGrid.innerHTML = '';
         statusMsg.textContent = `Processing ${binFiles.length} file(s)...`;
+
+        loadedMaps.forEach(m => {
+            if (m.image) URL.revokeObjectURL(m.image);
+        });
         loadedMaps = [];
+        currentIndex = -1;
+        document.getElementById('map-modal').classList.remove('active');
+        document.getElementById('modal-name').value = '';
+        document.getElementById('modal-author').value = '';
+        document.getElementById('modal-desc').value = '';
+        fileInput.value = '';
 
         for (let file of binFiles) {
             try {
@@ -649,9 +670,9 @@
 
                 const isPack = file.name.match(/\.(sgmaps|sgprefabs|sgmixed|zip)$/i);
                 
-                if (isPack && Object.keys(loadedZip.files).some(k => k.endsWith('.bin'))) {
+                if (isPack && Object.keys(loadedZip.files).some(k => !loadedZip.files[k].dir && k.toLowerCase().endsWith('.bin'))) {
                     for (let relativePath of Object.keys(loadedZip.files)) {
-                        if (relativePath.toLowerCase().endsWith('.bin')) {
+                        if (!loadedZip.files[relativePath].dir && relativePath.toLowerCase().endsWith('.bin')) {
                             const binBlob = await loadedZip.files[relativePath].async('blob');
                             binBlob.name = relativePath.split('/').pop();
                             await processSingleBin(binBlob, binBlob.name);
@@ -924,7 +945,7 @@
 
             if (change) {
                 const data = change.data;
-                compressedData = await deflateSingleFile(entry.name, data);
+                compressedData = entry.method === 0 ? data : await deflateSingleFile(entry.name, data);
                 crc = crc32(data);
                 uncompressedSize = data.length;
             }
@@ -988,12 +1009,15 @@
         let description = "";
         let imageBlob = null;
         let imagePath = "screenshot.jpg";
+        let infoPath = "info.json";
         let foundInfo = null;
         let itemType = "map";
 
         for (let relativePath of Object.keys(loadedZip.files)) {
+            if (loadedZip.files[relativePath].dir) continue;
             let lower = relativePath.toLowerCase();
             if (lower === 'info.json') {
+                infoPath = relativePath;
                 foundInfo = await loadedZip.files[relativePath].async('string');
             } else if (lower.endsWith('.jpg') || lower.endsWith('.png')) {
                 imagePath = relativePath;
@@ -1028,12 +1052,15 @@
             image: imageUrl,
             imageBlob: imageBlob,
             imagePath: imagePath,
+            infoPath: infoPath,
             originalBlob: new Blob([arrayBuffer], { type: 'application/octet-stream' }),
             originalBytes: new Uint8Array(arrayBuffer),
             zipStructure: zipStructure,
             zipObject: loadedZip,
             originalInfoText: foundInfo || '',
             isEdited: false,
+            isMetadataEdited: false,
+            isImageEdited: false,
             selected: false
         });
     }
@@ -1077,6 +1104,7 @@
         
         if (filteredMaps.length === 0) {
             mapGrid.innerHTML = '<p style="grid-column: 1/-1; text-align: center; color: var(--text-muted);">No items match your search.</p>';
+            updateBatchToolbar();
             return;
         }
 
@@ -1152,7 +1180,9 @@
     function openModal(index) {
         currentIndex = index;
         document.getElementById('edit-panel').classList.remove('active');
-        document.getElementById('edit-toggle-btn').textContent = '✏️ Edit Metadata';
+        const editBtn = document.getElementById('edit-toggle-btn');
+        editBtn.textContent = '✏️ Edit Metadata';
+        editBtn.style.background = '';
         updateModalContent();
         document.getElementById('map-modal').classList.add('active');
     }
@@ -1160,6 +1190,7 @@
     function closeModal() {
         saveCurrentModalData();
         document.getElementById('map-modal').classList.remove('active');
+        currentIndex = -1;
         filterMaps();
     }
 
@@ -1187,11 +1218,17 @@
         const map = loadedMaps[currentIndex];
         if (!map) return;
         map.isEdited = true;
+        map.isMetadataEdited = true;
     }
 
     function handleImageUpload(event) {
         const file = event.target.files[0];
         if (!file) return;
+
+        const targetIndex = currentIndex;
+        const targetMap = loadedMaps[targetIndex];
+        if (!targetMap) return;
+        event.target.value = '';
 
         const reader = new FileReader();
         reader.onload = function(e) {
@@ -1218,17 +1255,24 @@
                 ctx.drawImage(img, sx, sy, sw, sh, 0, 0, 1280, 720);
 
                 canvas.toBlob((blob) => {
-                    const map = loadedMaps[currentIndex];
-                    map.imageBlob = blob;
-                    map.image = URL.createObjectURL(blob);
-                    
-                    document.getElementById('modal-img').src = map.image;
-                    const cardWrapper = document.getElementById(`card-img-${currentIndex}`);
-                    if (cardWrapper) {
-                        cardWrapper.innerHTML = `<img src="${map.image}" alt="${escapeHtml(map.name)}">`;
+                    if (!blob) return;
+                    if (targetMap.image) {
+                        URL.revokeObjectURL(targetMap.image);
                     }
+                    targetMap.imageBlob = blob;
+                    targetMap.image = URL.createObjectURL(blob);
+                    targetMap.isImageEdited = true;
+                    targetMap.isEdited = true;
 
-                    markAsEdited();
+                    if (currentIndex === targetIndex) {
+                        const modalImg = document.getElementById('modal-img');
+                        modalImg.src = targetMap.image;
+                        modalImg.style.display = 'block';
+                    }
+                    const cardWrapper = document.getElementById(`card-img-${targetIndex}`);
+                    if (cardWrapper) {
+                        cardWrapper.innerHTML = `<img src="${targetMap.image}" alt="${escapeHtml(targetMap.name)}">`;
+                    }
                 }, 'image/jpeg', 0.9);
             };
             img.src = e.target.result;
@@ -1277,8 +1321,11 @@
     }
 
     function saveCurrentModalData() {
+        const modal = document.getElementById('map-modal');
+        if (!modal || !modal.classList.contains('active')) return;
+
         const map = loadedMaps[currentIndex];
-        if (!map) return;
+        if (!map || !map.isMetadataEdited) return;
 
         map.name = document.getElementById('modal-name').value.trim() || "Unknown";
         map.author = document.getElementById('modal-author').value.trim() || "Unknown Author";
@@ -1310,19 +1357,33 @@
             return { name: targetBinName, data: map.originalBytes };
         }
 
-        const infoObj = {
-            name: map.name,
-            author: map.author
-        };
-        if (map.description) {
-            infoObj.description = map.description;
+        const changedEntries = new Map();
+
+        if (map.isMetadataEdited) {
+            let infoObj = {};
+            if (map.originalInfoText) {
+                try {
+                    const parsedInfo = JSON.parse(map.originalInfoText.trim().replace(/^\uFEFF/, ''));
+                    if (parsedInfo && typeof parsedInfo === 'object' && !Array.isArray(parsedInfo)) {
+                        infoObj = parsedInfo;
+                    }
+                } catch (err) {
+                    infoObj = {};
+                }
+            }
+            infoObj.name = map.name;
+            infoObj.author = map.author;
+            if (map.description) {
+                infoObj.description = map.description;
+            } else {
+                delete infoObj.description;
+            }
+
+            const infoBytes = encodeUtf8(JSON.stringify(infoObj, null, 2));
+            changedEntries.set((map.infoPath || 'info.json').toLowerCase(), { data: infoBytes });
         }
 
-        const infoBytes = encodeUtf8(JSON.stringify(infoObj, null, 2));
-        const changedEntries = new Map();
-        changedEntries.set('info.json', { data: infoBytes });
-
-        if (map.imageBlob) {
+        if (map.isImageEdited && map.imageBlob) {
             const imageBytes = new Uint8Array(await map.imageBlob.arrayBuffer());
             changedEntries.set(map.imagePath.toLowerCase(), { data: imageBytes });
         }
